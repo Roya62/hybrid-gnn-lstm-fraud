@@ -1,21 +1,35 @@
 """
-Parallel LSTM‖GAT hybrid fraud detector for the IBM dataset.
+Sequential LSTM->GAT hybrid fraud detector for the IBM dataset.
 
-Sibling of lstm_gat_sequential_model.py. Same reuse contract: every
-leakage-safe / evaluation component comes from utils.py unchanged. The
-difference from the Sequential variant is architectural only: here LSTM and
-GAT both read the SAME encode() output independently (parallel branches)
-and are merged via cross-attention before classification, instead of LSTM
-feeding into GAT as a pipeline stage.
+Drop-in sibling of gatv2_model.py / gcn_model.py / graphsage_model.py.
+Reuses every leakage-safe / evaluation component from utils.py unchanged
+(FoldPreprocessor, split_groups_holdout, build_group_stratified_folds,
+build_graph_edges, choose_threshold, eval_from_probs, print_metrics,
+save_results_*). The ONLY new pieces are:
 
-Cross-attention direction: GAT features act as the query, LSTM features as
-key/value -- i.e. the relational branch selectively pulls in whichever
-temporal context is relevant, rather than the two branches being naively
-concatenated. The weighted LSTM contribution is added residually to the GAT
-features (fused = gat_features + attn_weights * V).
+  1. _build_seq_indices()   - per-node sequence grouping for the LSTM branch.
+                               Independent of graph_strategy (phi): it uses
+                               the same GROUP_KEY/sort-key logic already used
+                               for intra_group edges, so swapping graph
+                               strategies does not change how sequences are
+                               built, and swapping this model in does not
+                               change how graphs are built.
+  2. LSTMGATFraudModel      - encode() is copied verbatim from GATFraudModel
+                               so the two architectures see identical inputs;
+                               only the encoder stack differs (LSTM -> GAT
+                               vs GAT alone). hidden/heads default to the
+                               SAME values as cfg.HIDDEN_DIM / cfg.HEADS so
+                               capacity is comparable, not just structure.
+  3. train_loop_lstm / safe_inference_lstm / train_one_fold / run_pipeline
+                             - thin copies of the utils.py equivalents,
+                               extended only to also pass seq_indices through
+                               the forward() call. Everything else (AdamW,
+                               CosineAnnealingWarmRestarts, grad clipping,
+                               early stopping on val AP, pos_weight BCE,
+                               5-fold ensemble at test time) is identical.
 
 Graph strategies: multi_relation | hybrid | intra_group
-Run:  python lstm_gat_parallel_model.py
+Run:  python lstm_gat_sequential_model.py
 Outputs saved to ../outcomes/
 """
 
@@ -41,19 +55,35 @@ from utils import (
     save_results_csv, print_final_comparison,
 )
 
-MODEL_ARCH = "lstm_gat_par"
+MODEL_ARCH = "lstm_gat_seq"
 
 
 # ============================================================================
-#  SEQUENCE CONSTRUCTION  (identical to the Sequential file -- duplicated
-#  rather than cross-imported, to keep each model file self-contained in
-#  the same style as gatv2_model.py / gcn_model.py / graphsage_model.py,
-#  none of which import from one another)
+#  SEQUENCE CONSTRUCTION (the one genuinely new preprocessing step)
 # ============================================================================
 def _build_seq_indices(df_raw, cfg):
-    """Chunks oversized groups instead of truncating -- see
-    lstm_gat_sequential_model.py's _build_seq_indices for why truncation
-    was a real bug (silently zero-vector nodes past the size cap)."""
+    """
+    Group nodes by cfg.INTRA_GROUP_KEY (same key already used for the
+    intra_group graph strategy) and sort by the same temporal sort key
+    used everywhere else in this codebase (cfg.SORT_KEY_COLS).
+
+    Oversized groups are CHUNKED into consecutive windows of
+    INTRA_MAX_GROUP_SIZE, not truncated. Truncating silently dropped every
+    transaction past the cap from the LSTM pass entirely -- those nodes'
+    entries in `output` (see _run_lstm_over_groups) were never written, so
+    they stayed at their zero-initialized value and were fed into GAT as
+    literal all-zero feature vectors. For any card with more transactions
+    than INTRA_MAX_GROUP_SIZE, that meant real transactions were silently
+    replaced with garbage input rather than merely losing long-range
+    context. Chunking loses cross-chunk temporal context at the window
+    boundary but guarantees every node gets a genuine LSTM output.
+
+    Note: this is independent of `graph_strategy`. Whichever phi built the
+    edges, the LSTM sequence grouping is always this same per-card
+    chronological ordering, so swapping strategies never changes how
+    sequences are built, and swapping this model in never changes how
+    graphs are built.
+    """
     sort_key = _make_sort_key(df_raw, cfg.SORT_KEY_COLS)
     groups = []
     for _, idx in df_raw.groupby(cfg.INTRA_GROUP_KEY).groups.items():
@@ -67,60 +97,56 @@ def _build_seq_indices(df_raw, cfg):
 
 
 def _run_lstm_over_groups(lstm, x, groups, device):
+    """
+    Returns: [N, lstm_hidden*2] -- for every node, the LSTM's output at
+             ITS OWN position in its card's chronological sequence (i.e.
+             causal: informed by that card's history up to and including
+             this transaction, not the whole card averaged into one vector).
+    """
     N = x.size(0)
     out_dim = lstm.hidden_size * (2 if lstm.bidirectional else 1)
     output = torch.zeros(N, out_dim, device=device)
+
     if not groups:
         return output
+
     lengths = [len(g) for g in groups]
     max_len = max(lengths)
-    padded = torch.zeros(len(groups), max_len, x.size(1), device=device)
+    batch = len(groups)
+
+    padded = torch.zeros(batch, max_len, x.size(1), device=device)
     for i, g in enumerate(groups):
         padded[i, :len(g)] = x[torch.as_tensor(g, device=device)]
-    packed = nn.utils.rnn.pack_padded_sequence(padded, lengths, batch_first=True, enforce_sorted=False)
+
+    packed = nn.utils.rnn.pack_padded_sequence(
+        padded, lengths, batch_first=True, enforce_sorted=False
+    )
     lstm_out, _ = lstm(packed)
     unpacked, _ = nn.utils.rnn.pad_packed_sequence(lstm_out, batch_first=True)
+
     for i, g in enumerate(groups):
         idx_t = torch.as_tensor(g, device=device)
-        # See lstm_gat_sequential_model.py's _run_lstm_over_groups for why
-        # this explicit cast is required under AMP.
+        # Under AMP, `unpacked` may be Half (fp16) while `output` was
+        # allocated as float32. Basic slicing assignment (as used above for
+        # `padded`) casts implicitly, but advanced/fancy indexing via a
+        # LongTensor (this line) requires an exact dtype match in PyTorch,
+        # so we cast explicitly to avoid "Index put requires the source and
+        # destination dtypes match" under mixed precision.
         output[idx_t] = unpacked[i, :len(g)].to(output.dtype)
+
     return output
-
-
-class CrossAttentionFusion(nn.Module):
-    """GAT features query LSTM features; weighted LSTM value added residually to GAT."""
-
-    def __init__(self, lstm_dim, gat_dim):
-        super().__init__()
-        self.query = nn.Linear(gat_dim, gat_dim)
-        self.key   = nn.Linear(lstm_dim, gat_dim)
-        self.value = nn.Linear(lstm_dim, gat_dim)
-        # Zero-init the value projection: at step 0, V ≈ 0, so
-        # `fused = gat_features + attn * V ≈ gat_features` -- training
-        # starts mathematically identical to plain GATv2 and the model can
-        # only improve on that baseline by actively learning to pull in
-        # LSTM signal, rather than starting with random fusion noise
-        # injected into an otherwise-good GAT signal from epoch 1.
-        nn.init.zeros_(self.value.weight)
-        nn.init.zeros_(self.value.bias)
-        self.scale = gat_dim ** 0.5
-
-    def forward(self, lstm_features, gat_features):
-        Q = self.query(gat_features)
-        K = self.key(lstm_features)
-        V = self.value(lstm_features)
-        attn = torch.softmax(torch.sum(Q * K, dim=1, keepdim=True) / self.scale, dim=0)
-        return gat_features + attn * V
 
 
 # ============================================================================
 #  MODEL
 # ============================================================================
-class LSTMGATParallelFraudModel(nn.Module):
-    """encode() copied verbatim from GATFraudModel, exactly as in the
-    Sequential variant, so all three architectures (GAT-only, LSTM->GAT,
-    LSTM‖GAT) see identical input construction."""
+class LSTMGATFraudModel(nn.Module):
+    """
+    Sequential LSTM->GAT: LSTM encodes each card's chronological transaction
+    sequence; its OUTPUT (not the original features) is what GAT sees.
+    encode() is identical to GATFraudModel so both architectures receive the
+    same categorical/dense feature construction.
+    """
 
     def __init__(self, dense_in_dim, high_card_cols, low_card_cols,
                  factor_cardinalities, hidden, heads=2,
@@ -147,16 +173,16 @@ class LSTMGATParallelFraudModel(nn.Module):
         )
         lstm_out_dim = lstm_hidden * 2
         self.lstm_norm = nn.LayerNorm(lstm_out_dim)  # stabilizes LSTM output
-                                                       # scale before it's used
-                                                       # as key/value in fusion
+                                                       # scale before it feeds
+                                                       # GAT's attention, which
+                                                       # was tuned against
+                                                       # encode()'s scale, not
+                                                       # an LSTM's
 
-        self.gat1 = GATConv(in_dim, hidden, heads=heads, dropout=dropout)
+        self.gat1 = GATConv(lstm_out_dim, hidden, heads=heads, dropout=dropout)
         self.gat2 = GATConv(hidden*heads, hidden, heads=heads, dropout=dropout)
         self.norm1 = nn.LayerNorm(hidden*heads)
         self.norm2 = nn.LayerNorm(hidden*heads)
-
-        self.fusion = CrossAttentionFusion(lstm_out_dim, hidden*heads)
-
         self.cls = nn.Sequential(
             nn.Linear(hidden*heads, 128), nn.LeakyReLU(),
             nn.Dropout(dropout), nn.Linear(128, 1))
@@ -173,20 +199,15 @@ class LSTMGATParallelFraudModel(nn.Module):
 
     def forward(self, x_dense, x_high, x_low, edge_index, groups):
         x = F.dropout(self.encode(x_dense, x_high, x_low), p=self.dropout, training=self.training)
-
-        lstm_feat = self.lstm_norm(_run_lstm_over_groups(self.lstm, x, groups, x.device))
-
+        x = self.lstm_norm(_run_lstm_over_groups(self.lstm, x, groups, x.device))
         h = F.leaky_relu(self.norm1(self.gat1(x, edge_index)))
         h = F.dropout(h, p=self.dropout, training=self.training)
-        gat_feat = F.leaky_relu(self.norm2(self.gat2(h, edge_index)))
-
-        fused = self.fusion(lstm_feat, gat_feat)
-        fused = F.dropout(fused, p=self.dropout, training=self.training)
-        return self.cls(fused).view(-1)
+        h = F.leaky_relu(self.norm2(self.gat2(h, edge_index)))
+        return self.cls(h).view(-1)
 
 
 # ============================================================================
-#  SAFE INFERENCE / TRAIN LOOP  (same shape as the Sequential file)
+#  SAFE INFERENCE / TRAIN LOOP  (copies of utils.py versions + seq_indices)
 # ============================================================================
 @torch.no_grad()
 def safe_inference_lstm(model, x_d, x_h, x_l, edge_index, groups, device, use_amp=True):
@@ -209,6 +230,11 @@ def train_loop_lstm(model, x_d_tr, x_h_tr, x_l_tr, y_tr_t, edge_tr, groups_tr,
                     x_d_va, x_h_va, x_l_va, y_va_np, edge_va, groups_va,
                     cfg, device, verbose=False):
     pos = max(1, int(y_tr_t.sum().item())); neg = max(1, int(len(y_tr_t)-pos))
+    # Capped at 20x rather than the raw neg/pos ratio: on IBM's imbalance,
+    # an uncapped pos_weight can push nearly all logits positive before the
+    # (slower-to-converge, LSTM-containing) model has learned real signal --
+    # this was the likely cause of the intra_group collapse (recall 0.99,
+    # precision 0.09) seen before this fix.
     pos_weight = torch.tensor([min(neg/pos, 20.0)], dtype=torch.float32, device=device)
     crit = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     opt  = optim.AdamW(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
@@ -239,7 +265,7 @@ def train_loop_lstm(model, x_d_tr, x_h_tr, x_l_tr, y_tr_t, edge_tr, groups_tr,
 
 
 # ============================================================================
-#  FOLD TRAINING
+#  FOLD TRAINING  (mirrors gatv2_model.py train_one_fold, + seq_indices)
 # ============================================================================
 def train_one_fold(df_tr, df_va, cfg, graph_strategy, fold_idx=0, device=None):
     if device is None: device = get_device()
@@ -252,6 +278,7 @@ def train_one_fold(df_tr, df_va, cfg, graph_strategy, fold_idx=0, device=None):
     verbose = (fold_idx == 0)
     edge_tr = build_graph_edges(graph_strategy, df_tr_raw, X_d_tr, X_h_tr, X_l_tr, cfg, verbose)
     edge_va = build_graph_edges(graph_strategy, df_va_raw, X_d_va, X_h_va, X_l_va, cfg, verbose)
+
     groups_tr = _build_seq_indices(df_tr_raw, cfg)
     groups_va = _build_seq_indices(df_va_raw, cfg)
     del df_tr_raw, df_va_raw; gc.collect()
@@ -267,7 +294,7 @@ def train_one_fold(df_tr, df_va, cfg, graph_strategy, fold_idx=0, device=None):
     edge_va = edge_va.to(device)
     del X_d_tr, X_h_tr, X_l_tr, X_d_va, X_h_va, X_l_va; gc.collect()
 
-    model = LSTMGATParallelFraudModel(
+    model = LSTMGATFraudModel(
         dense_in_dim=x_d_tr.shape[1],
         high_card_cols=prep.high_card_cols, low_card_cols=prep.low_card_cols,
         factor_cardinalities=prep.factor_cardinalities,
@@ -291,7 +318,7 @@ def train_one_fold(df_tr, df_va, cfg, graph_strategy, fold_idx=0, device=None):
 
 
 # ============================================================================
-#  TEST ENSEMBLE
+#  TEST ENSEMBLE  (mirrors utils.run_test_ensemble, + seq_indices)
 # ============================================================================
 def run_test_ensemble_lstm(all_out, df_test, cfg, graph_strategy, device):
     test_probs = []
@@ -320,11 +347,11 @@ def run_test_ensemble_lstm(all_out, df_test, cfg, graph_strategy, device):
 
 
 # ============================================================================
-#  PIPELINE
+#  PIPELINE  (mirrors gatv2_model.py run_pipeline / run_all_strategies)
 # ============================================================================
 def run_pipeline(df, cfg, graph_strategy="multi_relation"):
     set_seed(cfg.SEED); device = get_device()
-    print(f"\n{'#'*60}\n# LSTM‖GAT (parallel) | {graph_strategy}\n{'#'*60}")
+    print(f"\n{'#'*60}\n# LSTM->GAT | {graph_strategy}\n{'#'*60}")
     df_dev, df_test = split_groups_holdout(
         df, cfg.GROUP_KEY, cfg.TARGET_COL, cfg.TRAIN_RATIO, cfg.STRATIFY_BINS, cfg.SEED)
     folds = build_group_stratified_folds(
