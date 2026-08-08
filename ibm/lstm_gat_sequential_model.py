@@ -1,4 +1,4 @@
-"""
+""" new
 Sequential LSTM->GAT hybrid fraud detector for the IBM dataset.
 
 Drop-in sibling of gatv2_model.py / gcn_model.py / graphsage_model.py.
