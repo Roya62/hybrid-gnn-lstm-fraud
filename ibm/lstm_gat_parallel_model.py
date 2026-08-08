@@ -1,4 +1,4 @@
-"""
+""" new
 Parallel LSTM‖GAT hybrid fraud detector for the IBM dataset.
 
 Sibling of lstm_gat_sequential_model.py. Same reuse contract: every
