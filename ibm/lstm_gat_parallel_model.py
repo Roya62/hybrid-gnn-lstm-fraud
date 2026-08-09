@@ -139,13 +139,13 @@ class LSTMGATParallelFraudModel(nn.Module):
         in_dim = (dense_in_dim + len(high_card_cols)*high_card_emb_dim
                   + len(low_card_cols)*low_card_emb_dim)
 
-        lstm_hidden = lstm_hidden or (hidden * heads // 2)
+        lstm_hidden = lstm_hidden or (hidden * heads)
         self.lstm = nn.LSTM(
             input_size=in_dim, hidden_size=lstm_hidden, num_layers=lstm_layers,
-            batch_first=True, bidirectional=True,
+            batch_first=True, bidirectional=False,
             dropout=dropout if lstm_layers > 1 else 0.0,
         )
-        lstm_out_dim = lstm_hidden * 2
+        lstm_out_dim = lstm_hidden  # unidirectional: 1x, not 2x
         self.lstm_norm = nn.LayerNorm(lstm_out_dim)  # stabilizes LSTM output
                                                        # scale before it's used
                                                        # as key/value in fusion
