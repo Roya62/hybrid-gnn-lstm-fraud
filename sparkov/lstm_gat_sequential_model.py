@@ -1,4 +1,4 @@
-"""
+""" 
 lstm_gat_sequential_model.py — Sequential LSTM→GAT hybrid for the Sparkov
 credit-card-transaction dataset.
 
@@ -270,7 +270,7 @@ def run_pipeline(df, cfg, graph_strategy="multi_relation"):
               "p_test_ens": p_ens, "y_test": y_test,
               "graph_strategy": graph_strategy, "model_arch": MODEL_ARCH}
     save_results_plots(result, cfg)
-    return result
+    return result 
 
 
 def run_all_strategies(df, cfg=None):
