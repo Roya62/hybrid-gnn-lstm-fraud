@@ -256,7 +256,7 @@ def run_pipeline(df, cfg):
 
 
 def run_all_strategies(df, cfg=None):
-    """Named run_all_strategies for drop-in compatibility with the
+    """ Named run_all_strategies for drop-in compatibility with the
     notebook's results-merging pattern, even though this model only
     produces ONE result (topology is not a variable it responds to)."""
     if cfg is None: cfg = CardFraudConfig()
