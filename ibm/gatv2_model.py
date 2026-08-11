@@ -137,7 +137,7 @@ def run_pipeline(df, cfg, graph_strategy="multi_relation"):
     all_out = []
     for i, (df_tr, df_va) in enumerate(folds, 1):
         print(f"  Fold {i}/{cfg.N_SPLITS}")
-        out = train_one_fold(df_tr, df_va, cfg, graph_strategy, i-1, device)
+        out = train_one_fold(df_tr, df_va, cfg, graph_strategy, i-1, device) 
         print_metrics("TRAIN", out["m_tr"]); print_metrics("VAL", out["m_va"])
         all_out.append(out); cleanup()
     p_ens, y_test, thr = run_test_ensemble(all_out, df_test, cfg, graph_strategy, device)
