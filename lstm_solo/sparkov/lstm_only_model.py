@@ -89,7 +89,7 @@ def _run_lstm_over_groups(lstm, x, groups, device):
 class LSTMOnlyFraudModel(nn.Module):
     def __init__(self, cardinalities, cat_cols, num_input_dim,
                  embedding_dim=8, hidden=64, heads=4,
-                 lstm_hidden=None, lstm_layers=2, dropout=0.30):
+                 lstm_hidden=None, lstm_layers=1, dropout=0.30):
         super().__init__()
         self.cat_cols = list(cat_cols)
         self.dropout  = dropout
