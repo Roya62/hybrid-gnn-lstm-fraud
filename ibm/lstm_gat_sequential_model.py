@@ -362,7 +362,7 @@ def run_pipeline(df, cfg, graph_strategy="multi_relation"):
         out = train_one_fold(df_tr, df_va, cfg, graph_strategy, i-1, device)
         print_metrics("TRAIN", out["m_tr"]); print_metrics("VAL", out["m_va"])
         all_out.append(out); cleanup()
-    p_ens, y_test, thr = run_test_ensemble_lstm(all_out, df_test, cfg, graph_strategy, device)
+    p_ens, y_test, thr = run_test_ensemble_lstm(all_out, df_test, cfg, graph_strategy, device) 
     m_test = eval_from_probs(y_test, p_ens, thr); print_metrics("TEST", m_test)
     result = {"all_out": all_out, "df_dev": df_dev, "df_test": df_test,
                "thr_global": thr, "test_metrics": m_test,
