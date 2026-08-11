@@ -111,7 +111,7 @@ class LSTMOnlyFraudModel(nn.Module):
 
     def __init__(self, dense_in_dim, high_card_cols, low_card_cols,
                  factor_cardinalities, hidden, heads=2,
-                 lstm_hidden=None, lstm_layers=2,
+                 lstm_hidden=None, lstm_layers=1,
                  dropout=0.30, high_card_emb_dim=8, low_card_emb_dim=4):
         super().__init__()
         self.dropout        = dropout
