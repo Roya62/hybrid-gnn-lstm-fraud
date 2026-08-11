@@ -344,7 +344,7 @@ def run_pipeline(df, cfg, graph_strategy="multi_relation"):
     save_results_plots(result, cfg)
     return result
 
-
+ 
 def run_all_strategies(df, cfg=None):
     if cfg is None: cfg = IBMFraudConfig()
     results = {}
