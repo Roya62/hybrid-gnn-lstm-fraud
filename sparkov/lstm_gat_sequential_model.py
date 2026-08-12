@@ -109,7 +109,7 @@ class LSTMGATSeqFraudModel(nn.Module):
             for col in cat_cols})
         in_ch = len(cat_cols) * embedding_dim + num_input_dim
 
-        lstm_hidden = lstm_hidden or (hidden * heads)
+        lstm_hidden = lstm_hidden or 64
         self.lstm = nn.LSTM(
             input_size=in_ch, hidden_size=lstm_hidden, num_layers=lstm_layers,
             batch_first=True, bidirectional=False,
