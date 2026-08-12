@@ -41,7 +41,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.amp import autocast, GradScaler
-from torch_geometric.nn import GATConv
+from torch_geometric.nn import GATv2Conv
 from sklearn.metrics import average_precision_score
 
 from config import IBMFraudConfig
@@ -179,8 +179,8 @@ class LSTMGATFraudModel(nn.Module):
                                                        # encode()'s scale, not
                                                        # an LSTM's
 
-        self.gat1 = GATConv(lstm_out_dim, hidden, heads=heads, dropout=dropout)
-        self.gat2 = GATConv(hidden*heads, hidden, heads=heads, dropout=dropout)
+        self.gat1 = GATv2Conv(lstm_out_dim, hidden, heads=heads, dropout=dropout)
+        self.gat2 = GATv2Conv(hidden*heads, hidden, heads=heads, dropout=dropout)
         self.norm1 = nn.LayerNorm(hidden*heads)
         self.norm2 = nn.LayerNorm(hidden*heads)
         self.cls = nn.Sequential(
