@@ -102,7 +102,7 @@ class LSTMOnlyFraudModel(nn.Module):
         # matching GATv2FraudModel's final layer output dimensionality --
         # keeps the classifier head architecture identical across
         # baseline / LSTM-only / Sequential / Parallel.
-        lstm_hidden = lstm_hidden or (hidden * heads)
+        lstm_hidden = lstm_hidden or 64
         self.lstm = nn.LSTM(
             input_size=in_ch, hidden_size=lstm_hidden, num_layers=lstm_layers,
             batch_first=True, bidirectional=False,
